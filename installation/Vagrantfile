@@ -1,0 +1,88 @@
+# -*- mode: ruby -*-
+# vi: set ft=ruby :
+#
+# =============================================================================
+#  Cluster Kubernetes de formation : 1 master + 2 workers
+#  kubeadm + containerd + Calico — Ubuntu Server 24.04 LTS
+#
+#  Hôte    : Windows 10/11 (ou Linux/macOS) + VirtualBox 7.x + Vagrant >= 2.3
+#  Réseau  : host-only 192.168.56.0/24
+#              k8s-master   192.168.56.10
+#              k8s-worker1  192.168.56.11
+#              k8s-worker2  192.168.56.12
+#
+#  Utilisation :
+#    vagrant up                 # crée master puis workers (dans cet ordre)
+#    vagrant ssh k8s-master
+#    kubectl get nodes -o wide
+#    vagrant destroy -f         # tout supprimer
+# =============================================================================
+
+Vagrant.require_version ">= 2.3.0"
+
+BOX_IMAGE      = "bento/ubuntu-24.04"
+K8S_VERSION    = "v1.35"            # branche du dépôt pkgs.k8s.io (version mineure)
+CALICO_VERSION = "v3.32.2"
+NETWORK_PREFIX = "192.168.56"
+NODE_CIDR      = "#{NETWORK_PREFIX}.0/24"
+POD_CIDR       = "10.244.0.0/16"    # ne doit PAS chevaucher 192.168.56.0/24
+                                     # (le défaut Calico 192.168.0.0/16 le chevauche !)
+
+NODES = [
+  { name: "k8s-master",  ip: "#{NETWORK_PREFIX}.10", cpus: 2, memory: 2048, role: "master" },
+  { name: "k8s-worker1", ip: "#{NETWORK_PREFIX}.11", cpus: 2, memory: 2048, role: "worker" },
+  { name: "k8s-worker2", ip: "#{NETWORK_PREFIX}.12", cpus: 2, memory: 2048, role: "worker" },
+]
+
+MASTER = NODES.find { |n| n[:role] == "master" }
+
+# "ip=nom,ip=nom,..." : une seule chaîne sans espace, sûre à passer en variable d'environnement
+CLUSTER_HOSTS = NODES.map { |n| "#{n[:ip]}=#{n[:name]}" }.join(",")
+
+Vagrant.configure("2") do |config|
+  config.vm.box              = BOX_IMAGE
+  config.vm.box_check_update = false
+  config.vm.boot_timeout     = 600     # postes de formation parfois lents
+  config.vm.synced_folder ".", "/vagrant"   # sert à transmettre join.sh aux workers
+
+  # Le master est défini en premier : avec VirtualBox, "vagrant up" crée les VM
+  # séquentiellement, le master est donc prêt avant que les workers ne le rejoignent.
+  NODES.each do |node|
+    config.vm.define node[:name], primary: node[:role] == "master" do |n|
+      n.vm.hostname = node[:name]
+      n.vm.network "private_network", ip: node[:ip]
+
+      n.vm.provider "virtualbox" do |vb|
+        vb.name         = node[:name]
+        vb.cpus         = node[:cpus]     # kubeadm exige au moins 2 vCPU sur le master
+        vb.memory       = node[:memory]   # kubeadm exige au moins ~1700 Mo
+        vb.gui          = false
+        vb.linked_clone = true
+        vb.customize ["modifyvm", :id, "--ioapic", "on"]
+        vb.customize ["modifyvm", :id, "--natdnshostresolver1", "on"]
+        vb.customize ["modifyvm", :id, "--groups", "/k8s-formation"]
+      end
+
+      n.vm.provision "shell", name: "common", path: "scripts/common.sh",
+        env: {
+          "K8S_VERSION"   => K8S_VERSION,
+          "NODE_IP"       => node[:ip],
+          "CLUSTER_HOSTS" => CLUSTER_HOSTS,
+        }
+
+      if node[:role] == "master"
+        n.vm.provision "shell", name: "master", path: "scripts/master.sh",
+          env: {
+            "MASTER_IP"      => node[:ip],
+            "NODE_NAME"      => node[:name],
+            "POD_CIDR"       => POD_CIDR,
+            "NODE_CIDR"      => NODE_CIDR,
+            "CALICO_VERSION" => CALICO_VERSION,
+          }
+      else
+        n.vm.provision "shell", name: "worker", path: "scripts/worker.sh",
+          env: { "MASTER_IP" => MASTER[:ip] }
+      end
+    end
+  end
+end
